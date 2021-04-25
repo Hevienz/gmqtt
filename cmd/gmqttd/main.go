@@ -38,6 +38,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&command.ConfigFile, "config", "c", command.ConfigFile, "The configuration file path")
 	rootCmd.AddCommand(command.NewStartCmd())
 	rootCmd.AddCommand(command.NewReloadCommand())
+	rootCmd.AddCommand(command.NewMergeConfigCommand())
 }
 
 func main() {
