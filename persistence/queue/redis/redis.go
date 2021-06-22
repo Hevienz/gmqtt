@@ -25,27 +25,32 @@ func getKey(clientID string) string {
 }
 
 type Options struct {
-	MaxQueuedMsg int
-	ClientID     string
-	DropHandler  server.OnMsgDropped
-	Pool         *redigo.Pool
+	MaxQueuedMsg    int
+	ClientID        string
+	InflightExpiry  time.Duration
+	Pool            *redigo.Pool
+	DefaultNotifier queue.Notifier
 }
 
 type Queue struct {
-	cond            *sync.Cond
-	clientID        string
-	version         packets.Version
-	readBytesLimit  uint32
-	max             int
-	len             int // the length of the list
+	cond           *sync.Cond
+	clientID       string
+	version        packets.Version
+	readBytesLimit uint32
+	// max is the maximum queue length
+	max int
+	// len is the length of the list
+	len             int
 	pool            *redigo.Pool
 	closed          bool
 	inflightDrained bool
-	current         int // the current read index of Queue list.
-	readCache       map[packets.PacketID][]byte
-	err             error
-	onMsgDropped    server.OnMsgDropped
-	log             *zap.Logger
+	// current is the current read index of Queue list.
+	current        int
+	readCache      map[packets.PacketID][]byte
+	err            error
+	log            *zap.Logger
+	inflightExpiry time.Duration
+	notifier       queue.Notifier
 }
 
 func New(opts Options) (*Queue, error) {
@@ -58,8 +63,9 @@ func New(opts Options) (*Queue, error) {
 		closed:          false,
 		inflightDrained: false,
 		current:         0,
+		inflightExpiry:  opts.InflightExpiry,
+		notifier:        opts.DefaultNotifier,
 		log:             server.LoggerWithField(zap.String("queue", "redis")),
-		onMsgDropped:    opts.DropHandler,
 	}, nil
 }
 
@@ -83,6 +89,15 @@ func (q *Queue) Close() error {
 	return nil
 }
 
+func (q *Queue) setLen(conn redigo.Conn) error {
+	l, err := conn.Do("llen", getKey(q.clientID))
+	if err != nil {
+		return err
+	}
+	q.len = int(l.(int64))
+	return nil
+}
+
 func (q *Queue) Init(opts *queue.InitOptions) error {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
@@ -95,17 +110,17 @@ func (q *Queue) Init(opts *queue.InitOptions) error {
 			return wrapError(err)
 		}
 	}
-	b, err := conn.Do("llen", getKey(q.clientID))
+	err := q.setLen(conn)
 	if err != nil {
 		return err
 	}
 	q.version = opts.Version
 	q.readBytesLimit = opts.ReadBytesLimit
-	q.len = int(b.(int64))
 	q.closed = false
 	q.inflightDrained = false
 	q.current = 0
 	q.readCache = make(map[packets.PacketID][]byte)
+	q.notifier = opts.Notifier
 	q.cond.Signal()
 	return nil
 }
@@ -130,32 +145,36 @@ func (q *Queue) Add(elem *queue.Elem) (err error) {
 		q.cond.L.Unlock()
 		q.cond.Signal()
 	}()
+
 	defer func() {
 		if drop {
+			if dropErr == queue.ErrDropExpiredInflight {
+				q.notifier.NotifyInflightAdded(-1)
+				q.current--
+			}
 			if dropBytes == nil {
-				queue.Drop(q.onMsgDropped, q.log, q.clientID, elem.MessageWithID.(*queue.Publish).Message, dropErr)
+				q.notifier.NotifyDropped(elem, dropErr)
 				return
 			} else {
 				err = conn.Send("lrem", getKey(q.clientID), 1, dropBytes)
 			}
-			queue.Drop(q.onMsgDropped, q.log, q.clientID, dropElem.MessageWithID.(*queue.Publish).Message, dropErr)
+			q.notifier.NotifyDropped(dropElem, dropErr)
+		} else {
+			q.notifier.NotifyMsgQueueAdded(1)
+			q.len++
 		}
 		_ = conn.Send("rpush", getKey(q.clientID), elem.Encode())
 		err = conn.Flush()
-		q.len++
 	}()
 	if q.len >= q.max {
 		// set default drop error
 		dropErr = queue.ErrDropQueueFull
 		drop = true
-		// drop the current elem if there is no more non-inflight messages.
-		if q.inflightDrained && q.current >= q.len {
-			return
-		}
 		var rs []interface{}
-		rs, err = redigo.Values(conn.Do("lrange", getKey(q.clientID), q.current, q.len))
+		// drop expired inflight message
+		rs, err = redigo.Values(conn.Do("lrange", getKey(q.clientID), 0, q.len))
 		if err != nil {
-			return err
+			return
 		}
 		var frontBytes []byte
 		var frontElem *queue.Elem
@@ -166,27 +185,42 @@ func (q *Queue) Add(elem *queue.Elem) (err error) {
 			if err != nil {
 				return
 			}
-			pub := e.MessageWithID.(*queue.Publish)
-			if pub.ID() == 0 {
-				// drop the front message
-				if i == 0 {
+			// inflight message
+			if i < q.current && queue.ElemExpiry(now, e) {
+				dropBytes = b
+				dropElem = e
+				dropErr = queue.ErrDropExpiredInflight
+				return
+			}
+			// non-inflight message
+			if i >= q.current {
+				if i == q.current {
 					frontBytes = b
 					frontElem = e
 				}
-				// drop expired message
-				if queue.ElemExpiry(now, e) {
-					dropErr = queue.ErrDropExpired
+				// drop qos0 message in the queue
+				pub := e.MessageWithID.(*queue.Publish)
+				// drop expired non-inflight message
+				if pub.ID() == 0 && queue.ElemExpiry(now, e) {
 					dropBytes = b
 					dropElem = e
+					dropErr = queue.ErrDropExpired
 					return
 				}
-				if pub.QoS == packets.Qos0 && dropElem == nil {
+				if pub.ID() == 0 && pub.QoS == packets.Qos0 && dropElem == nil {
 					dropBytes = b
 					dropElem = e
 				}
 			}
 		}
-		// drop qos0 message in the queue
+		// drop the current elem if there is no more non-inflight messages.
+		if q.inflightDrained && q.current >= q.len {
+			return
+		}
+		rs, err = redigo.Values(conn.Do("lrange", getKey(q.clientID), q.current, q.len))
+		if err != nil {
+			return err
+		}
 		if dropElem != nil {
 			return
 		}
@@ -198,7 +232,6 @@ func (q *Queue) Add(elem *queue.Elem) (err error) {
 			dropBytes = frontBytes
 			dropElem = frontElem
 		}
-
 		// the the messages in the queue are all inflight messages, drop the current elem
 		return
 	}
@@ -251,7 +284,7 @@ func (q *Queue) Read(pids []packets.PacketID) (elems []*queue.Elem, err error) {
 	if !q.inflightDrained {
 		panic("must call ReadInflight to drain all inflight messages before Read")
 	}
-	for (q.current >= q.len) && !q.closed {
+	for q.current >= q.len && !q.closed {
 		q.cond.Wait()
 	}
 	if q.closed {
@@ -261,6 +294,7 @@ func (q *Queue) Read(pids []packets.PacketID) (elems []*queue.Elem, err error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	var msgQueueDelta, inflightDelta int
 	var pflag int
 	for i := 0; i < len(rs); i++ {
 		b := rs[i].([]byte)
@@ -276,7 +310,8 @@ func (q *Queue) Read(pids []packets.PacketID) (elems []*queue.Elem, err error) {
 			if err != nil {
 				return nil, err
 			}
-			queue.Drop(q.onMsgDropped, q.log, q.clientID, e.MessageWithID.(*queue.Publish).Message, queue.ErrDropExpired)
+			q.notifier.NotifyDropped(e, queue.ErrDropExpired)
+			msgQueueDelta--
 			continue
 		}
 
@@ -288,27 +323,36 @@ func (q *Queue) Read(pids []packets.PacketID) (elems []*queue.Elem, err error) {
 			if err != nil {
 				return nil, err
 			}
-			queue.Drop(q.onMsgDropped, q.log, q.clientID, pub.Message, queue.ErrDropExceedsMaxPacketSize)
+			q.notifier.NotifyDropped(e, queue.ErrDropExceedsMaxPacketSize)
+			msgQueueDelta--
 			continue
 		}
 
 		if e.MessageWithID.(*queue.Publish).QoS == 0 {
 			err = conn.Send("lrem", getKey(q.clientID), 1, b)
 			q.len--
+			msgQueueDelta--
 			if err != nil {
 				return nil, err
 			}
 		} else {
 			e.MessageWithID.SetID(pids[pflag])
+			if q.inflightExpiry != 0 {
+				e.Expiry = now.Add(q.inflightExpiry)
+			}
 			pflag++
 			nb := e.Encode()
+
 			err = conn.Send("lset", getKey(q.clientID), q.current, nb)
 			q.current++
+			inflightDelta++
 			q.readCache[e.MessageWithID.ID()] = nb
 		}
 		elems = append(elems, e)
 	}
 	err = conn.Flush()
+	q.notifier.NotifyMsgQueueAdded(msgQueueDelta)
+	q.notifier.NotifyInflightAdded(inflightDelta)
 	return
 }
 
@@ -325,7 +369,8 @@ func (q *Queue) ReadInflight(maxSize uint) (elems []*queue.Elem, err error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	for _, v := range rs {
+	beginIndex := q.current
+	for index, v := range rs {
 		b := v.([]byte)
 		e := &queue.Elem{}
 		err := e.Decode(b)
@@ -334,6 +379,14 @@ func (q *Queue) ReadInflight(maxSize uint) (elems []*queue.Elem, err error) {
 		}
 		id := e.MessageWithID.ID()
 		if id != 0 {
+			if q.inflightExpiry != 0 {
+				e.Expiry = time.Now().Add(q.inflightExpiry)
+				b = e.Encode()
+				_, err = conn.Do("lset", getKey(q.clientID), beginIndex+index, b)
+				if err != nil {
+					return nil, err
+				}
+			}
 			elems = append(elems, e)
 			q.readCache[id] = b
 			q.current++
@@ -355,6 +408,8 @@ func (q *Queue) Remove(pid packets.PacketID) error {
 		if err != nil {
 			return err
 		}
+		q.notifier.NotifyMsgQueueAdded(-1)
+		q.notifier.NotifyInflightAdded(-1)
 		delete(q.readCache, pid)
 		q.len--
 		q.current--

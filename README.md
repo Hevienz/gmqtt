@@ -1,17 +1,14 @@
 [中文文档](https://github.com/DrmagicE/gmqtt/blob/master/README_ZH.md)
-# Gmqtt [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go) [![Build Status](https://travis-ci.org/DrmagicE/gmqtt.svg?branch=master)](https://travis-ci.org/DrmagicE/gmqtt) [![codecov](https://codecov.io/gh/DrmagicE/gmqtt/branch/master/graph/badge.svg)](https://codecov.io/gh/DrmagicE/gmqtt) [![Go Report Card](https://goreportcard.com/badge/github.com/DrmagicE/gmqtt)](https://goreportcard.com/report/github.com/DrmagicE/gmqtt)
+# Gmqtt [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go) ![Build Status](https://github.com/DrmagicE/gmqtt/actions/workflows/test.yml/badge.svg) [![codecov](https://codecov.io/gh/DrmagicE/gmqtt/branch/master/graph/badge.svg)](https://codecov.io/gh/DrmagicE/gmqtt) [![Go Report Card](https://goreportcard.com/badge/github.com/DrmagicE/gmqtt)](https://goreportcard.com/report/github.com/DrmagicE/gmqtt)
 
 News: Cluster mode is now supported, see [federation plugin](./plugin/federation/README.md) for examples and details.
-
-# Installation
-```$ go get -u github.com/DrmagicE/gmqtt```
 
 # Features
 * Provide hook method to customized the broker behaviours(Authentication, ACL, etc..). See `server/hooks.go` for details
 * Support tls/ssl and websocket
 * Provide flexible plugable mechanism. See `server/plugin.go` and `/plugin` for details.
 * Provide Go interface for extensions to interact with the server. For examples, the extensions or plugins can publish message or add/remove subscription through function call.
-See `Server` interface in `server/server.go` and [admin](https://github.com/DrmagicE/Gmqtt/blob/master/plugin/admin/READEME.md) for details.
+See `Server` interface in `server/server.go` and [admin](https://github.com/DrmagicE/Gmqtt/blob/master/plugin/admin/README.md) for details.
 * Provide metrics (by using Prometheus). (plugin: [prometheus](https://github.com/DrmagicE/gmqtt/blob/master/plugin/prometheus/README.md))
 * Provide GRPC and REST APIs to interact with server. (plugin:[admin](https://github.com/DrmagicE/gmqtt/blob/master/plugin/admin/README.md))
 * Provide session persistence which means the broker can retrieve the session data after restart. 
@@ -20,18 +17,20 @@ Currently, only redis backend is supported.
 
 
 # Get Started
-
+To get started with gmqtt, we need to compile it from the source code. Please ensure that you have a working
+Go environment.
+ 
 The following command will start gmqtt broker with default configuration.
 The broker listens on 1883 for tcp server and 8883 for websocket server with `admin` and `prometheus` plugin loaded.
 
 ```bash
-$ cd cmd/gmqttd
+$ git clone https://github.com/DrmagicE/gmqtt
+$ cd gmqtt/cmd/gmqttd
 $ go run . start -c default_config.yml
 ```
 
 ## configuration
-Gmqtt use `-c` flag to define configuration path. If not set, gmqtt reads `$HOME/gmqtt.yml` as default. If default path not exist, 
-Gmqtt will start with [default configuration](https://github.com/DrmagicE/gmqtt/blob/master/cmd/gmqttd/default_config.yml).
+Gmqtt use `-c` flag to define configuration path. If not set, gmqtt reads `$HOME/gmqtt.yml` as default.  Here is a [sample configuration](https://github.com/DrmagicE/gmqtt/blob/master/cmd/gmqttd/default_config.yml).
 
 ## session persistence
 Gmqtt uses memory to store session data by default and it is the recommended way because of the good performance.
@@ -91,7 +90,7 @@ Gmqtt implements the following hooks:
 | Name | hooking point | possible usages  |
 |------|------------|------------|
 | OnAccept  | When accepts a TCP connection.(Not supported in websocket)| Connection rate limit, IP allow/block list. |
-| OnStop  | When the broker exists |    |
+| OnStop  | When gmqtt stop |    |
 | OnSubscribe  | When received a subscribe packet | Subscribe access control, modifies subscriptions. |
 | OnSubscribed  | When subscribe succeed   |     |
 | OnUnsubscribe  |  When received a unsubscribe packet | Unsubscribe access controls, modifies the topics that is going to unsubscribe.|
